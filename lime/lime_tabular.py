@@ -4,6 +4,7 @@ Functions for explaining classifiers that use tabular data (matrices).
 import collections
 import copy
 import json
+import h2o
 
 import numpy as np
 import sklearn
@@ -227,7 +228,15 @@ class LimeTabularExplainer(object):
             metric=distance_metric
         ).ravel()
 
+        if type(data_row) is h2o.H2OFrame:
+            inverse = h2o.H2OFrame(inverse)
+            inverse.set_names(list(data_row.columns))
+        
         yss = classifier_fn(inverse)
+
+        if type(data_row) is h2o.H2OFrame:
+            yss = yss[['p0', 'p1']].as_data_frame().as_matrix()
+
         if self.class_names is None:
             self.class_names = [str(x) for x in range(yss[0].shape[0])]
         else:
@@ -313,6 +322,9 @@ class LimeTabularExplainer(object):
             first_row = data_row
         else:
             first_row = self.discretizer.discretize(data_row)
+
+        if type(data_row) is h2o.H2OFrame:
+            data_row = data_row.as_data_frame()
         data[0] = data_row.copy()
         inverse = data.copy()
         for column in categorical_features:
