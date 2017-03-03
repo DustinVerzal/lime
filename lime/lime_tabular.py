@@ -235,7 +235,7 @@ class LimeTabularExplainer(object):
         yss = classifier_fn(inverse)
 
         if type(data_row) is h2o.H2OFrame:
-            yss = yss[['p0', 'p1']].as_data_frame().as_matrix()
+            yss = yss.drop('predict').as_data_frame().as_matrix()
 
         if self.class_names is None:
             self.class_names = [str(x) for x in range(yss[0].shape[0])]
