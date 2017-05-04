@@ -4,6 +4,7 @@ Discretizers classes, to be used in lime_tabular
 import numpy as np
 import sklearn
 from abc import ABCMeta, abstractmethod
+import h2o
 
 
 class BaseDiscretizer():
@@ -89,6 +90,9 @@ class BaseDiscretizer():
         Returns:
             numpy array of same dimension, discretized.
         """
+        if type(data) is h2o.H2OFrame:
+            data = data.as_data_frame().as_matrix()[0]
+
         ret = data.copy()
         for feature in self.lambdas:
             if len(data.shape) == 1:
