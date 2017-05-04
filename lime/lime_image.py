@@ -6,6 +6,8 @@ import copy
 import numpy as np
 import sklearn
 import sklearn.preprocessing
+import skimage
+import h2o
 
 from . import lime_base
 
@@ -126,6 +128,8 @@ class LimeImageExplainer(object):
                          hide_color=None,
                          top_labels=5, num_features=100000, num_samples=1000,
                          batch_size=10,
+                         is_greyscale=False,
+                         is_H2O=False,
                          distance_metric='cosine', model_regressor=None):
         """Generates explanations for a prediction.
 
@@ -155,8 +159,15 @@ class LimeImageExplainer(object):
             explanations.
         """
         from skimage.segmentation import quickshift
+
+        if is_H2O:
+            image = image.as_data_frame().as_matrix().astype('float64')
+
+        if is_greyscale:
+            image = skimage.color.grey2rgb(image)
+
         segments = quickshift(image, kernel_size=4,
-                              max_dist=200, ratio=0.2)
+                              max_dist=200, ratio=0.4)
         fudged_image = image.copy()
         if hide_color is None:
             for x in np.unique(segments):
@@ -169,6 +180,7 @@ class LimeImageExplainer(object):
 
         data, labels = self.data_labels(image, fudged_image, segments,
                                         classifier_fn, num_samples,
+                                        is_greyscale, is_H2O,
                                         batch_size=batch_size)
 
         distances = sklearn.metrics.pairwise_distances(
@@ -197,6 +209,8 @@ class LimeImageExplainer(object):
                     segments,
                     classifier_fn,
                     num_samples,
+                    is_greyscale,
+                    is_H2O,
                     batch_size=10):
         """Generates images and predictions in the neighborhood of this image.
 
@@ -228,12 +242,38 @@ class LimeImageExplainer(object):
             for z in zeros:
                 mask[segments == z] = True
             temp[mask] = fudged_image[mask]
+            if is_greyscale:
+                temp = skimage.color.rgb2gray(temp)
+            if is_H2O:
+                temp = temp.flatten()
             imgs.append(temp)
             if len(imgs) == batch_size:
-                preds = classifier_fn(np.array(imgs))
-                labels.extend(preds)
+                if is_H2O:
+                        preds = classifier_fn(h2o.H2OFrame(np.array(imgs)))
+                        preds = preds.drop('predict')
+                        if len(labels) == 0:
+                            labels = preds.as_data_frame().as_matrix()
+                        else:
+                            labels = np.append(labels,
+                                               preds.as_data_frame()
+                                               .as_matrix(),
+                                               0)
+                else:
+                    preds = classifier_fn(np.array(imgs))
+                    labels.extend(preds)
                 imgs = []
         if len(imgs) > 0:
-            preds = classifier_fn(np.array(imgs))
-            labels.extend(preds)
+            if is_H2O:
+                preds = classifier_fn(h2o.H2OFrame(np.array(imgs)))
+                preds = preds.drop('predict')
+                if len(labels) == 0:
+                    labels = preds.as_data_frame().as_matrix()
+                else:
+                    labels = np.append(labels,
+                                       preds.as_data_frame()
+                                       .as_matrix(),
+                                       0)
+            else:
+                preds = classifier_fn(np.array(imgs))
+                labels.extend(preds)
         return data, np.array(labels)
