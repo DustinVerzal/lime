@@ -8,6 +8,7 @@ import json
 import numpy as np
 import sklearn
 import sklearn.preprocessing
+import h2o
 
 from lime.discretize import QuartileDiscretizer
 from lime.discretize import DecileDiscretizer
@@ -227,7 +228,15 @@ class LimeTabularExplainer(object):
             metric=distance_metric
         ).ravel()
 
+        if type(data_row) is h2o.H2OFrame:
+            inverse = h2o.H2OFrame(inverse)
+            inverse.set_names(list(data_row.columns))
+
         yss = classifier_fn(inverse)
+
+        if type(data_row) is h2o.H2OFrame:
+            yss = yss.drop('predict').as_data_frame().as_matrix()
+
         if self.class_names is None:
             self.class_names = [str(x) for x in range(yss[0].shape[0])]
         else:
@@ -236,10 +245,7 @@ class LimeTabularExplainer(object):
         if feature_names is None:
             feature_names = [str(x) for x in range(data_row.shape[0])]
 
-        def round_stuff(x):
-            return ['%.2f' % a for a in x]
-
-        values = round_stuff(data_row)
+        values = ['%.2f' % a for a in data_row]
         for i in self.categorical_features:
             if self.discretizer is not None and i in self.discretizer.lambdas:
                 continue
@@ -302,6 +308,9 @@ class LimeTabularExplainer(object):
                 inverse: same as data, except the categorical features are not
                 binary, but categorical (as the original data)
         """
+        if type(data_row) is h2o.H2OFrame:
+            data_row = data_row.as_data_frame().as_matrix()[0]
+
         data = np.zeros((num_samples, data_row.shape[0]))
         categorical_features = range(data_row.shape[0])
         if self.discretizer is None:
@@ -313,6 +322,7 @@ class LimeTabularExplainer(object):
             first_row = data_row
         else:
             first_row = self.discretizer.discretize(data_row)
+
         data[0] = data_row.copy()
         inverse = data.copy()
         for column in categorical_features:
@@ -330,3 +340,140 @@ class LimeTabularExplainer(object):
             inverse[1:] = self.discretizer.undiscretize(inverse[1:])
         inverse[0] = data_row
         return data, inverse
+
+
+class RecurrentTabularExplainer(LimeTabularExplainer):
+    """
+    An explainer for keras-style recurrent neural networks, where the
+    input shape is (n_samples, n_timesteps, n_features). This class
+    just extends the LimeTabularExplainer class and reshapes the training
+    data and feature names such that they become something like
+
+    (val1_t1, val1_t2, val1_t3, ..., val2_t1, ..., valn_tn)
+
+    Each of the methods that take data reshape it appropriately,
+    so you can pass in the training/testing data exactly as you
+    would to the recurrent neural network.
+
+    """
+    def __init__(self, training_data, training_labels=None, feature_names=None,
+                 categorical_features=None, categorical_names=None,
+                 kernel_width=None, verbose=False, class_names=None,
+                 feature_selection='auto', discretize_continuous=True,
+                 discretizer='quartile'):
+        """
+
+        Args:
+            training_data: numpy 3d array with shape
+                (n_samples, n_timesteps, n_features)
+            training_labels: labels for training data. Not required, but may be
+                used by discretizer.
+            feature_names: list of names (strings) corresponding to the columns
+                in the training data.
+            categorical_features: list of indices (ints) corresponding to the
+                categorical columns. Everything else will be considered
+                continuous. Values in these columns MUST be integers.
+            categorical_names: map from int to list of names, where
+                categorical_names[x][y] represents the name of the yth value of
+                column x.
+            kernel_width: kernel width for the exponential kernel.
+            If None, defaults to sqrt(number of columns) * 0.75
+            verbose: if true, print local prediction values from linear model
+            class_names: list of class names, ordered according to whatever the
+                classifier is using. If not present, class names will be '0',
+                '1', ...
+            feature_selection: feature selection method. can be
+                'forward_selection', 'lasso_path', 'none' or 'auto'.
+                See function 'explain_instance_with_data' in lime_base.py for
+                details on what each of the options does.
+            discretize_continuous: if True, all non-categorical features will
+                be discretized into quartiles.
+            discretizer: only matters if discretize_continuous is True. Options
+                are 'quartile', 'decile' or 'entropy'
+        """
+
+        # Reshape X
+        n_samples, n_timesteps, n_features = training_data.shape
+        training_data = np.transpose(training_data, axes=(0, 2, 1)).reshape(
+            n_samples, n_timesteps * n_features)
+        self.n_timesteps = n_timesteps
+        self.n_features = n_features
+
+        # Update the feature names
+        feature_names = ['{}_t-{}'.format(n, n_timesteps - (i + 1))
+                         for n in feature_names for i in range(n_timesteps)]
+
+        # Send off the the super class to do its magic.
+        super(RecurrentTabularExplainer, self).__init__(
+            training_data,
+            training_labels=training_labels,
+            feature_names=feature_names,
+            categorical_features=categorical_features,
+            categorical_names=categorical_names,
+            kernel_width=kernel_width, verbose=verbose,
+            class_names=class_names,
+            feature_selection=feature_selection,
+            discretize_continuous=discretize_continuous,
+            discretizer=discretizer)
+
+    def _make_predict_proba(self, func):
+        """
+        The predict_proba method will expect 3d arrays, but we are reshaping
+        them to 2D so that LIME works correctly. This wraps the function
+        you give in explain_instance to first reshape the data to have
+        the shape the the keras-style network expects.
+        """
+
+        def predict_proba(X):
+            n_samples = X.shape[0]
+            new_shape = (n_samples, self.n_features, self.n_timesteps)
+            X = np.transpose(X.reshape(new_shape), axes=(0, 2, 1))
+            return func(X)
+
+        return predict_proba
+
+    def explain_instance(self, data_row, classifier_fn, labels=(1,),
+                         top_labels=None, num_features=10, num_samples=5000,
+                         distance_metric='euclidean', model_regressor=None):
+        """Generates explanations for a prediction.
+
+        First, we generate neighborhood data by randomly perturbing features
+        from the instance (see __data_inverse). We then learn locally weighted
+        linear models on this neighborhood data to explain each of the classes
+        in an interpretable way (see lime_base.py).
+
+        Args:
+            data_row: 2d numpy array, corresponding to a row
+            classifier_fn: classifier prediction probability function, which
+                takes a numpy array and outputs prediction probabilities.  For
+                ScikitClassifiers , this is classifier.predict_proba.
+            labels: iterable with labels to be explained.
+            top_labels: if not None, ignore labels and produce explanations for
+                the K labels with highest prediction probabilities, where K is
+                this parameter.
+            num_features: maximum number of features present in explanation
+            num_samples: size of the neighborhood to learn the linear model
+            distance_metric: the distance metric to use for weights.
+            model_regressor: sklearn regressor to use in explanation. Defaults
+                to Ridge regression in LimeBase. Must have
+                model_regressor.coef_ and 'sample_weight' as a parameter
+                to model_regressor.fit()
+
+        Returns:
+            An Explanation object (see explanation.py) with the corresponding
+            explanations.
+        """
+
+        # Flatten input so that the normal explainer can handle it
+        data_row = data_row.T.reshape(self.n_timesteps * self.n_features)
+
+        # Wrap the classifier to reshape input
+        classifier_fn = self._make_predict_proba(classifier_fn)
+        return super(RecurrentTabularExplainer, self).explain_instance(
+            data_row, classifier_fn,
+            labels=labels,
+            top_labels=top_labels,
+            num_features=num_features,
+            num_samples=num_samples,
+            distance_metric=distance_metric,
+            model_regressor=model_regressor)
